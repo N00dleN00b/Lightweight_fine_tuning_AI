@@ -1,4 +1,4 @@
-# Lightweight_fine_tuning_AI
+# Lightweight Fine-Tuning with PEFT (LoRA)
 
 ## Project Goal
 
@@ -15,8 +15,19 @@ The project covers the full ML pipeline:
 
 - **Model**: GPT-2
 - **PEFT Technique**: LoRA (Low-Rank Adaptation)
-- **Dataset**: Hugging Face `datasets` library
+- **Dataset**: `sms_spam` (Hugging Face) — binary spam/ham classification
 - **Frameworks**: PyTorch, Hugging Face `transformers`, `peft`, `evaluate`
+
+---
+
+## Results
+
+| Metric   | Baseline | Fine-Tuned | Improvement |
+|----------|----------|------------|-------------|
+| Accuracy | 0.8637   | 0.9794     | +0.1157     |
+| F1 Score | 0.0000   | 0.9176     | +0.9176     |
+
+The baseline GPT-2 model predicted everything as "ham" (F1 = 0.0), meaning it had no ability to detect spam out of the box. After just **1 epoch of LoRA fine-tuning**, the model achieved **97.9% accuracy** and **0.92 F1 score** — while only training ~0.2% of the total parameters.
 
 ---
 
@@ -24,21 +35,17 @@ The project covers the full ML pipeline:
 
 ```
 Lightweight_fine_tuning_AI/
-├── notebook.ipynb        # Main project notebook
-├── gpt_lora/             # Saved LoRA adapter weights
+├── LightweightFineTuning.ipynb   # Main project notebook
+├── gpt_lora/                     # Saved LoRA adapter weights
 │   ├── adapter_config.json
 │   └── adapter_model.safetensors
-├── requirements.txt      # Python dependencies
-└── README.md             # This file
+├── requirements.txt              # Python dependencies
+└── README.md                     # This file
 ```
 
 ---
 
-## Step-by-Step Guide
-
-### Prerequisites
-
-Make sure you have Python 3.8+ installed. Then install dependencies:
+## Setup
 
 ```bash
 pip install -r requirements.txt
@@ -46,102 +53,179 @@ pip install -r requirements.txt
 
 ---
 
+## Step-by-Step Guide
+
 ### Step 1: Load and Evaluate the Foundation Model
 
-In `notebook.ipynb`, the pre-trained GPT-2 model is loaded for sequence classification:
-
 ```python
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch
+import numpy as np
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer
+)
+import evaluate
 
+# Load dataset
+dataset = load_dataset("sms_spam", trust_remote_code=True)
+split = dataset["train"].train_test_split(test_size=0.2, seed=42)
+train_dataset = split["train"]
+eval_dataset = split["test"]
+
+# Load model and tokenizer
 model_name = "gpt2"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no default pad token
+
 model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+model.config.pad_token_id = tokenizer.pad_token_id
 ```
 
-The model is evaluated on a dataset to record its **baseline performance** (accuracy/F1).
-
----
-
-### Step 2: Create a PEFT Config (LoRA)
-
-A LoRA config is created to define the adapter hyperparameters:
+### Step 2: Tokenize the Dataset
 
 ```python
-from peft import LoraConfig, get_peft_model
+def tokenize_function(examples):
+    return tokenizer(
+        examples["sms"],
+        padding="max_length",
+        truncation=True,
+        max_length=128
+    )
 
-config = LoraConfig(
+tokenized_train = train_dataset.map(tokenize_function, batched=True)
+tokenized_eval = eval_dataset.map(tokenize_function, batched=True)
+
+tokenized_train = tokenized_train.rename_column("label", "labels")
+tokenized_eval = tokenized_eval.rename_column("label", "labels")
+
+tokenized_train.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+tokenized_eval.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+```
+
+### Step 3: Evaluate Baseline Model
+
+```python
+accuracy_metric = evaluate.load("accuracy")
+f1_metric = evaluate.load("f1")
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    accuracy = accuracy_metric.compute(predictions=predictions, references=labels)["accuracy"]
+    f1 = f1_metric.compute(predictions=predictions, references=labels, average="binary")["f1"]
+    return {"accuracy": accuracy, "f1": f1}
+
+baseline_args = TrainingArguments(
+    output_dir="./baseline_results",
+    per_device_eval_batch_size=8,
+    use_cpu=not torch.cuda.is_available(),  # use_cpu replaces deprecated no_cuda
+    do_train=False,
+    do_eval=True
+)
+
+baseline_trainer = Trainer(
+    model=model,
+    args=baseline_args,
+    eval_dataset=tokenized_eval,
+    compute_metrics=compute_metrics
+)
+
+baseline_trainer.callback_handler.on_train_begin(
+    baseline_args, baseline_trainer.state, baseline_trainer.control
+)
+baseline_results = baseline_trainer.evaluate()
+```
+
+### Step 4: Create LoRA Config and Fine-Tune
+
+```python
+from peft import LoraConfig, get_peft_model, TaskType
+
+lora_config = LoraConfig(
     r=8,
     lora_alpha=32,
     lora_dropout=0.1,
-    task_type="SEQ_CLS"
+    task_type=TaskType.SEQ_CLS,
+    target_modules=["c_attn"]  # GPT-2 attention layer name
 )
 
-lora_model = get_peft_model(model, config)
+lora_model = get_peft_model(model, lora_config)
 lora_model.print_trainable_parameters()
-```
-
-This converts the model into a PEFT model where only the LoRA adapter parameters are trained (~0.2% of total parameters).
-
----
-
-### Step 3: Fine-Tune the PEFT Model
-
-The LoRA model is trained using the Hugging Face `Trainer`:
-
-```python
-from transformers import Trainer, TrainingArguments
 
 training_args = TrainingArguments(
-    output_dir="./results",
+    output_dir="./lora_results",
     num_train_epochs=1,
     per_device_train_batch_size=4,
-    evaluation_strategy="epoch"
+    per_device_eval_batch_size=8,
+    warmup_steps=50,
+    weight_decay=0.01,
+    logging_steps=50,
+    eval_strategy="epoch",       # replaces deprecated evaluation_strategy
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    use_cpu=not torch.cuda.is_available()
 )
 
-trainer = Trainer(
+lora_trainer = Trainer(
     model=lora_model,
     args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_eval,
+    compute_metrics=compute_metrics
 )
 
-trainer.train()
+lora_trainer.train()
 ```
 
----
-
-### Step 4: Save the Trained Adapter
-
-Only the adapter weights are saved (much smaller than the full model):
+### Step 5: Save and Reload the PEFT Model
 
 ```python
-lora_model.save_pretrained("gpt_lora")
-```
+# Save adapter weights only (much smaller than full model)
+lora_model.save_pretrained("/tmp/gpt_lora")
+tokenizer.save_pretrained("/tmp/gpt_lora")
 
----
-
-### Step 5: Load and Evaluate the Fine-Tuned Model
-
-The saved PEFT model is loaded using the PEFT-specific class:
-
-```python
+# Reload using PEFT-specific class
 from peft import AutoPeftModelForSequenceClassification
 
-loaded_model = AutoPeftModelForSequenceClassification.from_pretrained("gpt_lora")
+loaded_lora_model = AutoPeftModelForSequenceClassification.from_pretrained("/tmp/gpt_lora")
+loaded_lora_model.config.pad_token_id = tokenizer.pad_token_id
 ```
 
-The fine-tuned model is then evaluated and its performance is compared to the original baseline.
+### Step 6: Evaluate Fine-Tuned Model and Compare
+
+```python
+finetuned_args = TrainingArguments(
+    output_dir="./finetuned_results",
+    per_device_eval_batch_size=8,
+    use_cpu=not torch.cuda.is_available(),
+    do_train=False,
+    do_eval=True
+)
+
+finetuned_trainer = Trainer(
+    model=loaded_lora_model,
+    args=finetuned_args,
+    eval_dataset=tokenized_eval,
+    compute_metrics=compute_metrics
+)
+
+finetuned_trainer.callback_handler.on_train_begin(
+    finetuned_args, finetuned_trainer.state, finetuned_trainer.control
+)
+finetuned_results = finetuned_trainer.evaluate()
+```
 
 ---
 
-## Results
+## Key Takeaways
 
-| Model | Accuracy | F1 Score |
-|-------|----------|----------|
-| Base GPT-2 | TBD | TBD |
-| LoRA Fine-Tuned GPT-2 | TBD | TBD |
-
-> Results will be populated after running the notebook.
+- LoRA fine-tuning only trained **~0.2% of GPT-2's parameters** yet achieved a massive performance boost
+- The adapter weights saved to `gpt_lora/` are only a few MB compared to GPT-2's full 500MB
+- `use_cpu` replaces the deprecated `no_cuda` argument in newer versions of `transformers`
+- `eval_strategy` replaces the deprecated `evaluation_strategy` argument
 
 ---
 
